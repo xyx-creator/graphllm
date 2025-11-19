@@ -1,0 +1,44 @@
+# config.yaml
+model:
+  llm_path: "./Qwen3-8B"
+  tokenizer_path: "./Qwen3-8B"
+  device: "cuda:0"
+  llm_dtype: "bfloat16"
+  trust_remote_code: true
+  instruction_template: |
+    Please summarize the topic and content of the paper and its cited papers in English.
+
+    {context}
+  generate_prompt: |
+    Question: We are trying to explore the paper titled <{title}>. Please summarize the topic and content of the paper and its citations in English.
+
+    Answer: This paper
+  answer_prefix: "\n\nAnswer: "
+  text_max_len: 512
+  projector:
+    graph_dim: 384
+    projector_dim: 1024
+    num_query_tokens: 32
+    num_layers: 2
+    num_heads: 8
+    dropout: 0.1
+
+data:
+  metadata_csv: "/home/xyx/GraphTranslator/data/arxiv/summary_embeddings_random10000.csv"
+  teacher_csv: "train/output/teachers1000.csv"
+  embeddings_path: "graphclip_embeddings.pt"
+  max_samples: 1000
+
+training:
+  output_dir: "train/output"
+  save_path: "train/output/projector_stage1.pt"
+  batch_size: 8
+  num_epochs: 10
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+  log_interval: 5
+  seed: 42
+  freeze_llm: true
+  add_eos_token: true
