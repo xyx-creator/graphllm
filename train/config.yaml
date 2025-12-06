@@ -2,7 +2,7 @@
 model:
   llm_path: "./Qwen3-8B"
   tokenizer_path: "./Qwen3-8B"
-  device: "cuda:0"
+  device: "cuda:7"
   llm_dtype: "bfloat16"
   trust_remote_code: true
   instruction_template: |
@@ -11,12 +11,10 @@ model:
     {context}
   generate_prompt: |
     Question: We are trying to explore the paper titled <{title}>. Please summarize the topic and content of the paper and its citations in English.
-
-    Answer: This paper
   answer_prefix: "\n\nAnswer: "
   text_max_len: 512
   projector:
-    graph_dim: 384
+    graph_dim: 1024
     projector_dim: 1024
     num_query_tokens: 32
     num_layers: 2
@@ -25,16 +23,16 @@ model:
 
 data:
   metadata_csv: "/home/xyx/GraphTranslator/data/arxiv/summary_embeddings_random10000.csv"
-  teacher_csv: "train/output/teachers1000.csv"
-  embeddings_path: "graphclip_embeddings.pt"
-  max_samples: 1000
+  teacher_csv: "train/output/teachers10000.csv"
+  embeddings_path: "graphclip_embeddings.seq.pt"
+  max_samples: 10000
 
 training:
   output_dir: "train/output"
   save_path: "train/output/projector_stage1.pt"
-  batch_size: 8
-  num_epochs: 10
-  lr: 1.0e-4
+  batch_size: 16
+  num_epochs: 20
+  lr: 1.0e-3
   weight_decay: 0.01
   grad_accum_steps: 1
   max_grad_norm: 1.0

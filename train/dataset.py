@@ -18,11 +18,12 @@ def _ensure_sample_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _format_context(row: pd.Series) -> str:
+    # 保持原逻辑为空，或者填入你需要的 context 构建逻辑
     return ""
 
 
 class GraphTeacherDataset(Dataset):
-    """Pairs GraphCLIP embeddings with teacher-generated targets."""
+    """Pairs GraphCLIP sequence embeddings (pre-computed) with teacher-generated targets."""
 
     def __init__(
         self,
@@ -47,7 +48,8 @@ class GraphTeacherDataset(Dataset):
             raise FileNotFoundError(f"Metadata CSV not found: {self.metadata_csv}")
 
         LOGGER.info("Loading embeddings from %s", self.embeddings_path)
-        self.embeddings: Dict[int, torch.Tensor] = torch.load(
+        # 预期数据结构: {node_id: {'embedding': Tensor, 'mask': Tensor}}
+        self.embeddings_data: Dict[int, Dict[str, torch.Tensor]] = torch.load(
             self.embeddings_path, map_location="cpu"
         )
 
@@ -63,52 +65,63 @@ class GraphTeacherDataset(Dataset):
 
         self.samples: List[Dict[str, object]] = []
         skipped = 0
+        
         for _, row in teacher_df.iterrows():
+            # 1. 基础索引校验
             if pd.isna(row.get("sample_idx")):
                 skipped += 1
                 continue
+            
             sample_idx = int(row["sample_idx"])
             if sample_idx not in self.metadata.index:
                 skipped += 1
                 continue
+            
             meta = self.metadata.loc[sample_idx]
             node_id = int(meta["node_id"])
-            embedding = self.embeddings.get(node_id)
-            if embedding is None:
+            
+            # 2. Graph 数据校验 (同时获取 embedding 和 mask)
+            data_item = self.embeddings_data.get(node_id)
+            if data_item is None:
                 skipped += 1
                 continue
-            title = str(meta.get("title", "")).strip()
-            paper_summary = str(meta.get("paper_summary", "")).strip()
-            neighbor_summary = str(meta.get("citepapers_summary", "")).strip()
-            context = _format_context(meta)
-            instruction = self.instruction_template.format(
-                context=context,
-                title="",
-                paper_summary="",
-                neighbor_summary="",
-            ).strip()
-            if pd.isna(row.get("teacher_text")):
+            
+            # 显式检查 mask 是否存在，防止 Collate 崩溃
+            if "embedding" not in data_item or "mask" not in data_item:
                 skipped += 1
                 continue
-            teacher_text = str(row["teacher_text"]).strip()
+
+            # 3. 文本有效性校验 (防止 "nan" 被转为字符串 "nan")
+            raw_teacher_text = row.get("teacher_text")
+            if pd.isna(raw_teacher_text): 
+                skipped += 1
+                continue
+            
+            teacher_text = str(raw_teacher_text).strip()
             if not teacher_text:
                 skipped += 1
                 continue
-            self.samples.append(
-                {
-                    "node_id": node_id,
-                    "sample_idx": sample_idx,
-                    "embedding": embedding.float(),
-                    "instruction": instruction,
-                    "target": teacher_text,
-                    "title": title,
-                    "paper_summary": paper_summary,
-                    "neighbor_summary": neighbor_summary,
-                }
-            )
+
+            context = _format_context(meta)
+            instruction = self.instruction_template.format(
+                context=context,
+                title=str(meta.get("title", "")).strip(),
+                paper_summary=str(meta.get("paper_summary", "")).strip(),
+                neighbor_summary=str(meta.get("citepapers_summary", "")).strip(),
+            ).strip()
+
+            self.samples.append({
+                "node_id": node_id,
+                "sample_idx": sample_idx,
+                "graph_emb": data_item["embedding"].float(), # Shape: (S, D)
+                "graph_mask": data_item["mask"].long(),      # Shape: (S,)
+                "instruction": instruction,
+                "target": teacher_text,
+            })
 
         if not self.samples:
             raise RuntimeError("No usable samples found for training.")
+        
         LOGGER.info(
             "Loaded %d samples for training (skipped %d problematic rows).",
             len(self.samples),
@@ -123,9 +136,20 @@ class GraphTeacherDataset(Dataset):
 
 
 def collate_teacher_batch(batch: List[Dict[str, object]]) -> Dict[str, object]:
-    embeddings = torch.stack([item["embedding"] for item in batch])
+    # 1. Stack Embeddings: (B, S, D)
+    embeddings = torch.stack([item["graph_emb"] for item in batch])
+    
+    # 2. Stack Masks: (B, S) - 此时已确保 mask 存在且为 Tensor
+    masks = torch.stack([item["graph_mask"] for item in batch])
+    
+    # 3. Pack into dictionary for Model
+    graph_batch = {
+        "embedding": embeddings,
+        "mask": masks
+    }
+
     return {
-        "graph_emb": embeddings,
+        "graph_batch": graph_batch,
         "instructions": [item["instruction"] for item in batch],
         "targets": [item["target"] for item in batch],
         "node_ids": [item["node_id"] for item in batch],

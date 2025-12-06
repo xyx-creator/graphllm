@@ -206,17 +206,71 @@ class GraphLLM(nn.Module):
             raise ValueError("Unexpected graph encoder output.")
         if self.graph_feature_type == "center" and len(features) > 1:
             return features[1]
+        if self.graph_feature_type in {"sequence", "nodes"} and len(features) > 2:
+            return features[2]
         return features[0]
+
+    def _pad_node_embeddings(
+        self,
+        node_embs: torch.Tensor,
+        batch_index: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if batch_index.numel() == 0:
+            raise ValueError("Empty batch_index for node embeddings.")
+        node_embs = node_embs.to(device)
+        batch_index = batch_index.to(device)
+        num_graphs = int(batch_index.max().item()) + 1
+        if num_graphs <= 0:
+            raise ValueError("Invalid num_graphs derived from batch_index.")
+
+        counts = [(batch_index == gid).sum().item() for gid in range(num_graphs)]
+        max_nodes = int(max(counts))
+        if max_nodes == 0:
+            raise ValueError("All graphs appear to be empty.")
+
+        padded = []
+        masks = []
+        for gid, count in enumerate(counts):
+            nodes_g = node_embs[batch_index == gid]
+            pad_len = max_nodes - int(count)
+            if pad_len > 0:
+                nodes_g = torch.cat(
+                    [nodes_g, node_embs.new_zeros((pad_len, node_embs.size(-1)))],
+                    dim=0,
+                )
+            padded.append(nodes_g)
+            masks.append(
+                torch.cat(
+                    [
+                        torch.ones(int(count), device=device, dtype=torch.long),
+                        torch.zeros(pad_len, device=device, dtype=torch.long),
+                    ],
+                    dim=0,
+                )
+            )
+        return torch.stack(padded, dim=0), torch.stack(masks, dim=0)
 
     def encode_graph(
         self,
         batch: Union[torch.Tensor, Any],
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        use_node_sequence = self.graph_feature_type in {"sequence", "nodes"}
         if self.graph_encoder is None:
-            if not isinstance(batch, torch.Tensor):
-                raise TypeError("Expect tensor embeddings when graph_encoder is None.")
-            graph_emb = batch.to(self.device)
+            # Accept raw tensors or (embedding, mask) / {"embedding","mask"} tuples when no encoder.
+            if isinstance(batch, dict) and "embedding" in batch:
+                graph_emb = batch["embedding"]
+                attention_mask = batch.get("mask", attention_mask)
+            elif isinstance(batch, (tuple, list)) and len(batch) == 2:
+                graph_emb, attention_mask = batch
+            elif isinstance(batch, torch.Tensor):
+                graph_emb = batch
+            else:
+                raise TypeError("Expect tensor embeddings or (embedding, mask) when graph_encoder is None.")
+            graph_emb = graph_emb.to(self.device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
             return graph_emb, attention_mask
 
         data = batch
@@ -229,7 +283,35 @@ class GraphLLM(nn.Module):
             else contextlib.nullcontext()
         )
         with forward_ctx:
-            features = self.graph_encoder.encode_graph(data)
+            if use_node_sequence:
+                if hasattr(self.graph_encoder, "encode_nodes_only"):
+                    features = self.graph_encoder.encode_nodes_only(data)
+                elif hasattr(self.graph_encoder, "encode_graph_with_nodes"):
+                    features = self.graph_encoder.encode_graph_with_nodes(data)
+                else:
+                    raise ValueError(
+                        "Graph encoder does not expose node-level embeddings. "
+                        "Provide precomputed node sequences or use graph_feature_type='graph'."
+                    )
+            else:
+                features = self.graph_encoder.encode_graph(data)
+
+        # If we requested node sequences and got them, build padded outputs + mask.
+        if use_node_sequence and isinstance(features, (tuple, list)):
+            if len(features) >= 4:
+                node_embs = features[2]
+                node_batch = features[3]
+                graph_emb, node_mask = self._pad_node_embeddings(
+                    node_embs, node_batch, device=self.device
+                )
+                return graph_emb, node_mask
+            if len(features) == 2 and isinstance(features[0], torch.Tensor) and isinstance(features[1], torch.Tensor):
+                node_embs, node_batch = features
+                graph_emb, node_mask = self._pad_node_embeddings(
+                    node_embs, node_batch, device=self.device
+                )
+                return graph_emb, node_mask
+
         graph_emb = self._select_graph_feature(features).to(self.device)
         return graph_emb, attention_mask
 
@@ -367,7 +449,11 @@ class GraphLLM(nn.Module):
             attention_mask=attention_mask,
             **gen_kwargs,
         )
-        new_tokens = sequences[:, prompt_len:]
+        # Some HF models return only the generated tokens when inputs_embeds are provided.
+        if sequences.size(1) <= prompt_len:
+            new_tokens = sequences
+        else:
+            new_tokens = sequences[:, prompt_len:]
         return self.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
 
     # ------------------------------------------------------------------
